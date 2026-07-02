@@ -1,15 +1,8 @@
----
-name: github-aiflow-analysis
-description: >
-  GitHub AI Flow 全自动分析工具。当用户扔一个 GitHub 链接（Issue/PR/Actions Run）要求分析、诊断 CI 错误、找最新运行、读取 Issue 内容/评论、发布评论或提交修复 PR 时触发。
-  Covers: opensourceways/backlog AI-Flow pipeline analysis, CI log diagnosis, readinessProbe/progressDeadlineSeconds time-window conflict detection,
-  sync.sh heredoc escaping issues, self-hosted runner crash debugging, deployment health check triage.
-  所有分析自动引用 references/ 中的 AI Flow 架构知识库。数据获取使用 scripts/ 下的 gh CLI 封装脚本或 curl API 直接调用。
----
-
 # GitHub AI Flow Analyzer
 
-用户扔一个 GitHub 链接，自动抓取、分析、存档。支持 Issue 分析、CI 日志诊断、从 Issue 自动提取最新 Run 链接、发布评论（审核后）、提交修复 PR。
+用户扔一个 GitHub 链接，自动抓取、分析、诊断、归档。专注 **Issue 分析** 和 **CI 日志诊断**。
+
+---
 
 ## 基于第一性原理
 
@@ -21,12 +14,13 @@ GitHub URL → [1] 获取数据 → [2] 模式匹配 → [3] 执行操作 → [4
 
 | 原子操作 | 含义 | 实现 |
 |---------|------|------|
-| **获取数据** | 从 GitHub API 拉取 Issue/评论/日志 | `scripts/gh-issue.sh`, `scripts/gh-actions.sh` |
-| **模式匹配** | 将症状对号入座到已知根因模式 | 见下方「核心：失败模式匹配」 |
-| **执行操作** | 按用户意图评论/提 PR | `scripts/gh-comment.sh`, git commit + PR |
+| **获取数据** | 从 GitHub API 拉取 Issue/评论/日志 | `github-ops/scripts/` (数据层 skill) |
+| **模式匹配** | 将症状对号入座到已知根因模式 | 见下方「失败模式匹配」 |
+| **执行操作** | 按用户意图评论/提 PR | `github-ops/scripts/gh-comment.sh`, git commit + PR |
 | **归档知识** | 将分析结果持久化到 Obsidian | `write` to `/Users/gorden/LLM/Obsidian/knowledgeBase/` |
 
 **核心原则**：
+- 数据获取委托 [github-ops](../github-ops/SKILL.md) skill，本 skill 不直接操作 GitHub API
 - 先匹配已知模式，再推理未知根因
 - 日志分析不是 grep error，而是追溯全链路（YAML → 探针 → Pod → Runner）
 - 评论和 PR 操作必须经用户确认，禁止自动执行
@@ -65,13 +59,41 @@ git -c user.name="yyl-support" -c user.email="1275703733@qq.com" commit ...
 
 **管线速查**：
 
-| 管线 | 输入 | 产出 | 出口 |
+| 管线 | 输入 | 产出 | 归档 |
 |------|------|------|------|
-| **A - Issue 分析** | Issue/PR 链接 | 正文+评论摘要 | 归档到 `other/` |
-| **B - CI 日志分析** | Actions Run/Job 链接 | 错误根因分析 | 归档到 `error/` |
+| **A - Issue 分析** | Issue/PR 链接 | 正文+评论摘要 | `other/` |
+| **B - CI 日志分析** | Actions Run/Job 链接 | 错误根因分析 | `error/` |
 | **C - 从 Issue 找 Run** | Issue 链接 | 最新 Run 链接 | 继续走管线 B |
 | **D - 发布评论** | Issue 链接 + 内容 | 评论发布 | **先预览 → 用户确认 → 再发布** |
 | **E - 提交修复 PR** | 修改代码 | PR 提交 | **先展示 diff → 用户确认 → 再提交** |
+
+---
+
+## 数据获取（委托 github-ops）
+
+本 Skill 不直接调用 GitHub API。所有数据获取通过 `github-ops/scripts/` 完成：
+
+```bash
+# Issue 查询
+bash github-ops/scripts/gh-issue.sh get <owner/repo> <issue_number>
+
+# CI 日志
+bash github-ops/scripts/gh-actions.sh runs <owner/repo> [count]
+bash github-ops/scripts/gh-actions.sh job <owner/repo> <run_id>
+bash github-ops/scripts/gh-actions.sh log <owner/repo> <job_id> all
+
+# 日志错误提取
+bash github-ops/scripts/gh-log-errors.sh <owner/repo> <job_id>
+
+# 从 Issue 找 CI Run
+bash github-ops/scripts/gh-find-run.sh <owner/repo> <issue_number>
+bash github-ops/scripts/gh-find-run.sh <owner/repo> <issue_number> -j
+
+# 发布评论
+echo "评论内容" | bash github-ops/scripts/gh-comment.sh <owner/repo> <issue_number> -p "/ai-xxx"
+```
+
+> 详细用法见 [github-ops SKILL.md](../github-ops/SKILL.md)
 
 ---
 
@@ -108,7 +130,7 @@ progressDeadlineSeconds          ← "天花板"，Deployment 最长等待
   ├─ 有 CrashLoopBackOff / ProbeError？
   │   └─ 进入「K8s 探针时间窗口」分支：比较三个参数
   ├─ 有 "unbound variable"？
-  │   └─ 进入「heredoc 转义」分支：读取 sync.sh 源文件交叉验证
+  │   └─ 进入「heredoc 转义」分支：读取源文件交叉验证
   ├─ 有 "timeout" / "deadline"？
   │   └─ 进入「时间窗口冲突」分支：检查三个不等式
   ├─ 有 "artifact storage"？
@@ -135,44 +157,10 @@ progressDeadlineSeconds          ← "天花板"，Deployment 最长等待
 
 ---
 
-## 获取数据：脚本速查
-
-### Issue / PR
-
-```bash
-bash scripts/gh-issue.sh get <owner/repo> <issue_number>     # 详情 + 评论
-bash scripts/gh-issue.sh comments <owner/repo> <issue_number> # 仅评论（增量）
-bash scripts/gh-issue.sh watch <owner/repo> <issue_number>    # 实时监控
-```
-
-### CI 日志
-
-```bash
-bash scripts/gh-actions.sh runs <owner/repo> [count]           # 最近 N 个 runs
-bash scripts/gh-actions.sh job <owner/repo> <run_id>           # 一个 run 的所有 jobs
-bash scripts/gh-actions.sh log <owner/repo> <job_id> all       # 完整日志
-bash scripts/gh-actions.sh log <owner/repo> <job_id> 500        # 最后 500 行
-bash scripts/gh-actions.sh log <owner/repo> <job_id> 50:200     # 第 50-200 行
-bash scripts/gh-log-errors.sh <owner/repo> <job_id>             # 自动提取错误行及上下文
-```
-
-日志缓存目录: `~/.gh-actions-cache/<repo>/<job_id>.log`
-
-### 从 Issue 找 CI Run
-
-```bash
-bash scripts/gh-find-run.sh <owner/repo> <issue_number>        # 获取最新 CI run 链接
-bash scripts/gh-find-run.sh <owner/repo> <issue_number> -j     # JSON 格式（run_id/job_id）
-```
-
-从最新一条 `github-actions[bot]` 评论中提取 run 链接。拿到后走 CI 日志分析管线。
-
----
-
 ## 分析诊断流程
 
-1. **获取原始数据**：运行对应脚本获取 Issue 正文/评论或 CI 日志
-2. **匹配已知模式**：对照「核心：失败模式匹配」决策链，定位根因类型
+1. **获取原始数据**：调用 github-ops 脚本获取 Issue 正文/评论或 CI 日志
+2. **匹配已知模式**：对照「失败模式匹配」决策链，定位根因类型
 3. **交叉验证源文件**：日志引用的脚本（preview.sh, sync.sh 等）通过 GitHub API 读取实际内容验证
 4. **对照知识库**：读取相应的 references/ 文档确认架构理解
 5. **输出结论**：按以下格式给出结构化结论：
@@ -184,6 +172,30 @@ bash scripts/gh-find-run.sh <owner/repo> <issue_number> -j     # JSON 格式（r
 2. **是否与已知模式匹配**
 3. **修复建议**（如有）
 4. **关联知识**（references/ 文档中的相关章节）
+
+---
+
+## Feedback 生成
+
+分析完成后，根据用户意图生成 feedback 内容。Feedback 是通过 Issue 评论注入给 AI agent 的上下文信息。
+
+### Feedback 类型
+
+| 场景 | feedback 内容 | 前缀命令 |
+|------|-------------|---------|
+| 首次预览有部署错误 | 详细错误根因 + 建议修复 | `/ai-develop-preview` |
+| 设计已定稿仅代码修复 | 具体代码修改建议 | `/ai-develop-preview --skip-design` |
+| 仅需重部署即可验证 | 部署参数修正 | `/ai-develop-preview --deploy-only` |
+| 门禁失败 | 失败项 + 修复方案 | `/ai-develop-submit` |
+| 全部门禁 | 整体通过情况 | `/ai-develop-submit --allgate` |
+
+### Feedback 格式
+
+```
+<前缀命令> （独占第一行，命令后自动空格）
+这一行开始是正文，描述遇到的问题、根因分析、建议的修复方向。
+具体的技术细节可以作为上下文注入给 AI agent。
+```
 
 ---
 
@@ -237,40 +249,13 @@ bash scripts/gh-find-run.sh <owner/repo> <issue_number> -j     # JSON 格式（r
 
 **绝对禁止直接发布评论。**
 
-1. 根据用户意图确定前缀命令
+1. 根据用户意图确定前缀命令（参考「Feedback 生成」表）
 2. 编写评论内容，展示给用户
-3. 等用户确认后，通过脚本发布：
+3. 等用户确认后，通过 github-ops 发布：
 
 ```bash
-echo "评论正文..." | bash scripts/gh-comment.sh <owner/repo> <issue_number> -p "<命令>"
+echo "评论正文..." | bash github-ops/scripts/gh-comment.sh <owner/repo> <issue_number> -p "/ai-develop-preview"
 ```
-
-脚本参数：
-
-| 参数 | 说明 |
-|------|------|
-| `-p <prefix>` | 评论前缀命令（自动追加空格再拼接正文） |
-| `-f <file>` | 从文件读取正文（默认从 stdin） |
-| `-d` | 仅预览不发布（dry-run） |
-
-### 常用前缀命令
-
-```bash
--p "/ai-develop-preview"                   # 开发预览
--p "/ai-develop-preview --skip-design"      # 设计冻结
--p "/ai-develop-preview --deploy-only"      # 仅重部署
--p "/ai-develop-submit"                    # 开发提交
--p "/ai-develop-submit --allgate"          # 全部安全门禁
--p "/ai-deploy-test"                       # 测试发布
--p "/ai-requirement-analysis"              # 需求分析
-```
-
-### 前缀规则
-
-- 前缀命令独占第一行，命令后自动空格再换行接正文
-- 命令后的正文内容会被注入给 AI agent 作为上下文（feedback）
-- `--skip-design` 和 `--design` 互斥，不要同时使用
-- 不需要触发 AI 命令时省略 `-p`
 
 ### E. 提交修复 PR（必须审核）
 
@@ -279,33 +264,14 @@ echo "评论正文..." | bash scripts/gh-comment.sh <owner/repo> <issue_number> 
 1. 修改代码，用 `git diff` 展示变更
 2. 等用户确认后，commit → push → 创建 PR
 
-#### 步骤
+```bash
+git -c user.name="yyl-support" -c user.email="1275703733@qq.com" \
+  commit -m "fix: <提交信息>
 
-1. **Clone**: `git clone https://github.com/<owner>/<repo>.git <local-dir>`
-2. **分支**: `git checkout -b fix/<描述>`
-3. **提交**:
-   ```bash
-   git -c user.name="yyl-support" -c user.email="1275703733@qq.com" \
-     commit -m "fix: <提交信息>
+<详细说明>
 
-   <详细说明>
-
-   关联: <issue 链接>"
-   ```
-4. **Push**: `git push "https://x-access-token:${GH_TOKEN}@github.com/<owner>/<repo>.git" fix/<描述>`
-5. **创建 PR**: 通过 GitHub API
-
-**PR 提交后检查**：确认 CLA 标签正常（邮箱必须用 `1275703733@qq.com`），如出现 `cla/no` 检查 commit 作者邮箱。
-
----
-
-## Prerequisites
-
-GitHub Token 优先级：
-
-1. `GH_COMMENT_TOKEN` 环境变量
-2. `GH_TOKEN` 环境变量
-3. `~/.gh-token` 文件
+关联: <issue 链接>"
+```
 
 ---
 
@@ -334,29 +300,7 @@ design → push_design_pr_now → dev → deploy → tester(冒烟) → 回评
 
 ---
 
-## 附录 B：脚本速查
-
-| 脚本 | 用途 |
-|------|------|
-| `scripts/gh-issue.sh get/comments/watch` | Issue 查询 |
-| `scripts/gh-actions.sh runs/job/log` | Actions 日志 |
-| `scripts/gh-log-errors.sh` | 从缓存日志提取错误行及上下文 |
-| `scripts/gh-find-run.sh` | 从 Issue 评论提取最新 CI run 链接 |
-| `scripts/gh-comment.sh` | 发布评论（支持前缀命令、预览后发布） |
-
----
-
-## 附录 C：backlog AI Flow 命令参考
-
-### Issue 评论命令
-
-| 阶段 | 命令 | 用途 |
-|------|------|------|
-| [1] | `/ai-requirement-analysis [反馈]` | 启动需求分析，产出 PR |
-| [2] | `/ai-develop-preview [参数]` | 出设计文档 + 代码 + 预览 + 冒烟 |
-| [3] | `/ai-develop-submit [参数]` | 门禁 + 对抗 review → 开代码 PR |
-| [4] | `/ai-deploy-test [社区]` | 构建镜像 → ArgoCD → 集成测试 |
-| [5] | `/ai-release-plan create <URL>` | 跨仓触发发布计划 |
+## 附录 B：backlog AI Flow 命令参考
 
 ### `/ai-develop-preview` 参数
 
